@@ -1,10 +1,9 @@
 -module(messages_forwarding).
 -author("Ron Zilber").
--export([ring_parallel/2, ring_serial/2, mesh_parallel/3, mesh_serial/3]).  
-
+-export([ring_parallel/2, ring_serial/2, mesh_parallel/3, mesh_serial/3]).
+-define(MICRO_TO_MILLI, 1000).
 %% -------------------- ring_parallel(N,M)  ------------------------------------------------------------------------------------------------------------ %%
 % Spread M copies of a message from the head process toward a ring of N processes
-
 ring_parallel(N, M) ->
     StartTime = erlang:timestamp(),                                                       % Measure the starting time of the function
     put(startTime, StartTime), put(dupsAmount, M),
@@ -20,7 +19,7 @@ ring_parallel() ->
     receive
         {done, EndTime} ->                                                                
             StartTime = get(startTime), M = get(dupsAmount),
-            ElapsedTime = timer:now_diff(EndTime, StartTime)/1000,
+            ElapsedTime = timer:now_diff(EndTime, StartTime)/?MICRO_TO_MILLI,             %  Devide by 1000
             put(status, done),
             put(return_message, {ElapsedTime, M, M});
 
@@ -42,22 +41,21 @@ ringProcessLoop(Number, M, List, Pid_of_Calling_Function) ->
     Pid_Of_New_Node = spawn(fun() -> nodeProcess(Pid_of_Calling_Function, M) end),
     
     ringProcessLoop(Number - 1, M, List ++ [Pid_Of_New_Node], Pid_of_Calling_Function).   %  Add the new process to the PIDs list
-
 % ------ nodeProcess ---------------
-nodeProcess(Pid, M) ->                                                                    %  
+nodeProcess(Pid, M) ->                                                                     
     put(pid_of_caller , Pid), put(dups_Amount, M), put(status, onRun),
     nodeProcess().
 
 nodeProcess()->
     receive
-        {start, Ring, M}->                                                                %  Used to wake up process P1 and make him send M messages in the ring
-            generateLoop(Ring, M, M);
-
-        {[H | T], MessageNumber, _From} ->                                                %  Each node at the ring will forward the message to the next node                                  
-            H ! {T, MessageNumber, self()};      
-            
-        {[], MessageNumber, _From} ->                                                     %  P1 will get an empty list and when the M-th message will arrive he will
-            M = get(dups_Amount),                                                         %  send 'done' update to the calling function
+        {start, Ring, M}->                                                               %  Used to wake up process P1 and make him send M messages in the ring
+            %generateLoop(Ring, M, M);
+            Messages = lists:seq(1, M),
+            [H|T] = Ring,
+            lists:map(fun(Message_Index)->  (H!{T, Message_Index, self()}) end, Messages);
+        
+         {[], MessageNumber, _From} ->                                                     %  P1 will get an empty list and when the M-th message will arrive he will
+            M = get(dups_Amount),                                                          %  send 'done' update to the calling function
             if
                 MessageNumber == M ->
                     God = get(pid_of_caller),       % It's a joke
@@ -66,10 +64,16 @@ nodeProcess()->
                     God ! {done, EndTime};
 
                 true -> ok
-            end;       
+            end;                    
+                
+        {[H | T], MessageNumber, _From} ->                                                 %  Each node at the ring will forward the message to the next node                                  
+            H ! {T, MessageNumber, self()};  
+
+        {H , MessageNumber, _From} ->                                                      %  Each node at the ring will forward the message to the next node                                  
+            H ! {[], MessageNumber, self()};      
+                     
         _anyMessage ->
-            unknown_message_received
-            
+            unknown_message_received            
         end,
     Status = get(status),                                                                 %  Go back into the receive block only if the status is not 'done'
     if
@@ -77,47 +81,39 @@ nodeProcess()->
             nodeProcess();
         true-> ok
     end.
-% ------ generateLoop -----------------------------                                       % Used to generate and forward M messages from P1 to P2
-generateLoop([_H|_T], _Times_M , 0) -> 
-    ok;
-generateLoop([H|T], Times_M, Left_To_Send) ->
-    H ! {T, Times_M - Left_To_Send + 1, self()},
-    generateLoop([H|T], Times_M, Left_To_Send - 1). 
 %% -------------------- ring_seriall(V,M)  ------------------------------------------------------------------------------------------------------------ %%
 % Spread M copies of a message from the head process toward a ring of N nodes (in a serial implementation)
 ring_serial(V, M) ->
-    StartTime = erlang:timestamp(),                                                       % Measure the starting time of the function
-    put(start_time ,StartTime),
+    Start_Time = erlang:timestamp(),                                                       % Measure the starting time of the function
+    put(start_time ,Start_Time),
     put(dups_amount, M),
     List = lists:seq(1, V), [H | T] = List,
     Ring = T ++ [H],
-    Message = "hello in serial version~n",
-    ring_serial(Ring, M, Message),
-
-    MessageCount = M,
-    self() ! {List, Message, MessageCount, MessageCount},
     Status = notDone,
     put(status, Status),
+    Messages = lists:seq(1, M),
+    lists:map(fun(Message_Index)->  (self()!{Ring, Message_Index}) end, Messages),
     ring_serial(). 
-% ------ ring_serial -----------------------------
-ring_serial(List, MessageCount, Message) ->
-    self() ! {List, Message, MessageCount, MessageCount},
-    ring_serial().
-
+% -----------------------------------
 ring_serial() ->                                                                                         
     receive
-        {[], _Message, _MessageCount, _Left} ->
-            self()!{done};
+        {[], Message_Index} ->
+            M = get(dups_amount),
+            if          
+                Message_Index == M ->
+                    self()!{done};
+                true -> ok
+            end;
             
-        {[_H | T], Message, MessageCount, 1} ->
-            self() ! {T, Message, MessageCount, MessageCount};
+        {[_H | T], Message_Index} ->
+            self() ! {T, Message_Index};
 
-        {[H | T], Message, MessageCount, _To_Send} ->
-            self() ! {[H | T], Message, MessageCount, _To_Send - 1};
+        {_H, Message_Index} ->
+            self() ! {[], Message_Index};
 
         {done}->
-            Status = done,
             EndTime = erlang:timestamp(),
+            Status = done,
             put(status,Status),
             put(end_time ,EndTime);           
         _ ->
@@ -125,24 +121,23 @@ ring_serial() ->
     end,
     ProcessStatus = get(status),
     if
-        ProcessStatus /= done ->
-            ring_serial();
-        true ->
+            ProcessStatus == done ->
             Start_Time = get(start_time), End_Time = get(end_time), 
-            %io:format("Start: ~p End: ~p~n", [Start_Time, End_Time]),
-
-            ElapsedTime = timer:now_diff(End_Time, Start_Time)/1000, M = get(dups_amount),
-            {ElapsedTime, M, M}
+            ElapsedTime = timer:now_diff(End_Time, Start_Time)/?MICRO_TO_MILLI,           %  Devide by 1000
+            M_Copies = get(dups_amount),
+            {ElapsedTime, M_Copies , M_Copies};
+        true ->
+            ring_serial()
     end.
 %% -------------------- mesh_parallel(N,M, C)  ------------------------------------------------------------------------------------------------------------ %%
 % Spread M copies of a message from a main process toward a mesh of NxN processes (avoid duplications/ messages storms)
 mesh_parallel(N, M, C) ->
-    StartTime = erlang:timestamp(),                                                      % Measure the starting time of the function
-    Mesh = meshProcessLoop(N * N, N, [], C, self()),                                     % Returns a list of length N^2 that represents the NxN mesh
-    lists:map(fun(Process) -> notify(Process, Mesh) end, Mesh),
+    StartTime = erlang:timestamp(),                                                       %  Measure the starting time of the function
+    Mesh = meshProcessLoop(N * N, N, [], C, self()), put(mesh, Mesh),                     %  Returns a list of length N^2 that represents the NxN mesh
+    lists:map(fun(Process) -> notify(Process, Mesh) end, Mesh),                           %  Send the updated pids list to all of the mesh nodes
     MainProcess = lists:nth(C, Mesh),
-    MainProcess ! {mainProcess, M, StartTime},
-    mesh_parallel().
+    MainProcess ! {mainProcess, M, StartTime},                                            %  Send a start message to the main process
+    mesh_parallel().                                                                      %  Move to the receive block to check the mailbox
      
 mesh_parallel()->
     put(status, notDone),
@@ -158,7 +153,9 @@ mesh_parallel()->
     if
         Status /= done->
             mesh_parallel();
-        true-> get(return_message)
+        true-> 
+            lists:map(fun(Pid)-> exit(Pid, finished) end, get(mesh)),    %  Terminate all involved processes
+            get(return_message)
     end.
 % ------ getNeighbors -----------------------------                      %  Generates a list of neighbor indexes of an input index in an NxN grid
 getNeighbors(1, _Index) ->                                               %  If N = 1, an NxN grid is not possible...
@@ -262,9 +259,7 @@ meshProcess() ->
                         true->                         % The message is from another process
                             ok 
                         end,
-
-                    put(mailbox,lists:append(MailBox,[Message])),
-                    
+                    put(mailbox,lists:append(MailBox,[Message])),              
                     lists:map(fun(Pid) -> Pid!{SourcePid, MessageNumber} end, MyNeighbors);
                                             
                 true->
@@ -280,7 +275,7 @@ meshProcess() ->
             if                   
                 length(Acks_List) == (Nsquared- 1) * M_Copies ->
                     EndTime = erlang:timestamp(),
-                    ElapsedTime = timer:now_diff(EndTime, Start_Time)/1000,
+                    ElapsedTime = timer:now_diff(EndTime, Start_Time)/?MICRO_TO_MILLI,             %  Devide by 1000
                     get(pid_of_caller)!{ElapsedTime, M_Copies *length(NeighborsList), (Nsquared - 1) * M_Copies};
                    ok;  
                 true -> 
@@ -289,9 +284,9 @@ meshProcess() ->
         true ->        
         meshProcess()
     end.
-    
+ % -------------------------------   
 spreadMessages(_Message, [], _DupsAmount, _Left) ->                                 % Spread M messages to each element in a given list
-    ok;
+    ok;                                                                             % Used to spread M copies to each neighbor of the main process
 spreadMessages(Message, [_H | T], DupsAmount, 0) ->
     spreadMessages(Message, T, DupsAmount, DupsAmount);
 spreadMessages(Message, [H | T], DupsAmount, _To_Send) ->
@@ -303,7 +298,6 @@ meshProcessLoop(0, _N, List, _C, _Pid) -> List;                                 
 meshProcessLoop(Number, N, List , C, Pid) ->
     PID = spawn(fun() -> meshProcess([] , N, C, Pid) end),   
     meshProcessLoop(Number - 1, N, List ++ [PID], C, Pid).                          %  Add the new process to the PIDs list
-
 %% -------------------- mesh_serial(N, M, C)  ------------------------------------------------------------------------------------------------------------ %%
 % Spread M copies of a message from a main process toward a mesh of NxN nodes (avoid duplications/ messages storms) - serial implemantation
 mesh_serial(N,M,C)->
@@ -376,14 +370,14 @@ mesh_serial()->
     if
         EndCondition == done ->
             EndTime = erlang:timestamp(), M = get(m), C = get(c), 
-            ElapsedTime = timer:now_diff(EndTime, StartTime)/1000,
+            ElapsedTime = timer:now_diff(EndTime, StartTime)/?MICRO_TO_MILLI,             %  Devide by 1000
             
             {ElapsedTime, M*length(lists:nth(C, get(neighbors_lists))), M*(Nsquare-1)};
         true->
     mesh_serial()
     end.
  % --------------------------------------------------------------    
-serialSpreadMessages(_Message, _M_, 0) -> ok;                                                %   Spreads M copies of a message to each element in a given list
+serialSpreadMessages(_Message, _M_, 0) -> ok;                                             %   Spreads M copies of a message to each element in a given list
 serialSpreadMessages({SourceIndex,Dest_Neighbor}, M, _To_Send)->
     self()!{{SourceIndex,M - _To_Send + 1}, Dest_Neighbor},  
     serialSpreadMessages({SourceIndex,Dest_Neighbor}, M, _To_Send - 1).
